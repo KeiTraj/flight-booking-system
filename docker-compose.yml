@@ -1,0 +1,163 @@
+services:
+  # Primary PostgreSQL Database
+  primary-db:
+    image: postgres:15
+    container_name: primary-db
+    environment:
+      POSTGRES_DB: flightdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - primary-data:/var/lib/postgresql/data
+      - ./init-primary.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./postgresql-primary.conf:/etc/postgresql/postgresql.conf
+      - wal-archive:/var/lib/postgresql/wal_archive
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    networks:
+      - flight-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Hot Backup Server (Physical Replication)
+  hot-backup:
+    image: postgres:15
+    container_name: hot-backup
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5433:5432"
+    volumes:
+      - backup-data:/var/lib/postgresql/data
+      - ./setup-replica.sh:/docker-entrypoint-initdb.d/setup-replica.sh
+    depends_on:
+      primary-db:
+        condition: service_healthy
+    networks:
+      - flight-network
+    command: >
+      bash -c "
+      until pg_isready -h primary-db -U postgres; do sleep 1; done;
+      if [ ! -f /var/lib/postgresql/data/pgdata/PG_VERSION ]; then
+        rm -rf /var/lib/postgresql/data/pgdata/*;
+        PGPASSWORD=postgres pg_basebackup -h primary-db -D /var/lib/postgresql/data/pgdata -U replicator -Fp -Xs -P -R;
+        chmod 700 /var/lib/postgresql/data/pgdata;
+      fi;
+      postgres -D /var/lib/postgresql/data/pgdata
+      "
+
+  # Reports & Visualizations Database (Logical Replication)
+  reports-db:
+    image: postgres:15
+    container_name: reports-db
+    environment:
+      POSTGRES_DB: flightdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5434:5432"
+    volumes:
+      - reports-data:/var/lib/postgresql/data
+      - ./init-reports.sql:/docker-entrypoint-initdb.d/01-init-reports.sql
+    depends_on:
+      primary-db:
+        condition: service_healthy
+    networks:
+      - flight-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # WAL Archiver (runs hourly)
+  wal-archiver:
+    image: postgres:15
+    container_name: wal-archiver
+    volumes:
+      - wal-archive:/wal_archive
+      - ./wal-archive.sh:/wal-archive.sh
+    depends_on:
+      - primary-db
+    networks:
+      - flight-network
+    entrypoint: >
+      bash -c "
+      while true; do
+        echo 'WAL Archive check at' $$(date);
+        ls -lh /wal_archive/ | tail -20;
+        sleep 3600;
+      done
+      "
+
+  # Web Application
+  web-app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: flight-app
+    ports:
+      - "3000:3000"
+    environment:
+      PRIMARY_DB_HOST: primary-db
+      PRIMARY_DB_PORT: 5432
+      PRIMARY_DB_NAME: flightdb
+      PRIMARY_DB_USER: postgres
+      PRIMARY_DB_PASSWORD: postgres
+      REPORTS_DB_HOST: reports-db
+      REPORTS_DB_PORT: 5432
+      REPORTS_DB_NAME: flightdb
+      REPORTS_DB_USER: postgres
+      REPORTS_DB_PASSWORD: postgres
+      NODE_ENV: production
+    depends_on:
+      primary-db:
+        condition: service_healthy
+      reports-db:
+        condition: service_healthy
+    networks:
+      - flight-network
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Load Testing with Apache JMeter
+  jmeter:
+    image: justb4/jmeter:5.5
+    container_name: jmeter
+    volumes:
+      - ./jmeter:/tests
+      - ./jmeter/results:/results
+    depends_on:
+      web-app:
+        condition: service_healthy
+    networks:
+      - flight-network
+    entrypoint: >
+      bash -c "
+      echo 'Waiting for web app to be ready...';
+      sleep 30;
+      echo 'Starting load tests...';
+      jmeter -n -t /tests/flight-booking-load-test.jmx -l /results/results.jtl -e -o /results/report;
+      echo 'Load test completed. Results in /results/report';
+      tail -f /dev/null;
+      "
+
+volumes:
+  primary-data:
+  backup-data:
+  reports-data:
+  wal-archive:
+
+networks:
+  flight-network:
+    driver: bridge
