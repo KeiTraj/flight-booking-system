@@ -13,8 +13,13 @@ services:
       - primary-data:/var/lib/postgresql/data
       - ./init-primary.sql:/docker-entrypoint-initdb.d/01-init.sql
       - ./postgresql-primary.conf:/etc/postgresql/postgresql.conf
+      - ./pg_hba-primary.conf:/etc/postgresql/pg_hba.conf
       - wal-archive:/var/lib/postgresql/wal_archive
-    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    command: >
+      bash -c "
+      chown -R postgres:postgres /var/lib/postgresql/wal_archive;
+      exec gosu postgres postgres -c config_file=/etc/postgresql/postgresql.conf
+      "
     networks:
       - flight-network
     healthcheck:
@@ -31,11 +36,16 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       PGDATA: /var/lib/postgresql/data/pgdata
+      REPLICATOR_ROLE: replicator
+      REPLICATOR_PASSWORD: replicator_password
+      PRIMARY_HOST: primary-db
+      PRIMARY_PORT: 5432
     ports:
       - "5433:5432"
     volumes:
       - backup-data:/var/lib/postgresql/data
       - ./setup-replica.sh:/docker-entrypoint-initdb.d/setup-replica.sh
+      - ./postgresql-standby.conf:/etc/postgresql/postgresql.conf
     depends_on:
       primary-db:
         condition: service_healthy
@@ -43,13 +53,14 @@ services:
       - flight-network
     command: >
       bash -c "
-      until pg_isready -h primary-db -U postgres; do sleep 1; done;
+      until pg_isready -h ${PRIMARY_HOST:-primary-db} -U ${REPLICATOR_ROLE:-replicator}; do sleep 1; done;
+      chown -R postgres:postgres /var/lib/postgresql/data;
       if [ ! -f /var/lib/postgresql/data/pgdata/PG_VERSION ]; then
         rm -rf /var/lib/postgresql/data/pgdata/*;
-        PGPASSWORD=postgres pg_basebackup -h primary-db -D /var/lib/postgresql/data/pgdata -U replicator -Fp -Xs -P -R;
+        PGPASSWORD=${REPLICATOR_PASSWORD:-replicator_password} gosu postgres pg_basebackup -h ${PRIMARY_HOST:-primary-db} -p ${PRIMARY_PORT:-5432} -D /var/lib/postgresql/data/pgdata -U ${REPLICATOR_ROLE:-replicator} -Fp -Xs -P -R;
         chmod 700 /var/lib/postgresql/data/pgdata;
       fi;
-      postgres -D /var/lib/postgresql/data/pgdata
+      exec gosu postgres postgres -D /var/lib/postgresql/data/pgdata -c config_file=/etc/postgresql/postgresql.conf
       "
 
   # Reports & Visualizations Database (Logical Replication)
@@ -83,18 +94,14 @@ services:
     volumes:
       - wal-archive:/wal_archive
       - ./wal-archive.sh:/wal-archive.sh
+    environment:
+      ARCHIVE_RETENTION_HOURS: 168
+      ARCHIVE_POLL_INTERVAL: 600
     depends_on:
       - primary-db
     networks:
       - flight-network
-    entrypoint: >
-      bash -c "
-      while true; do
-        echo 'WAL Archive check at' $$(date);
-        ls -lh /wal_archive/ | tail -20;
-        sleep 3600;
-      done
-      "
+    entrypoint: ["bash", "/wal-archive.sh"]
 
   # Web Application
   web-app:
