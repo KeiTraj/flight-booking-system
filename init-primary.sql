@@ -187,8 +187,8 @@ FOR EACH ROW
 EXECUTE FUNCTION update_booking_timestamp();
 
 -- Create publication for logical replication
-CREATE PUBLICATION reports_pub FOR TABLE 
-    airlines, flights, bookings, booking_details, customers, seats;
+CREATE PUBLICATION reports_pub FOR TABLE
+    airlines, flights, bookings, booking_details, customers, seats, aircraft;
 
 -- Insert sample data
 INSERT INTO airlines (code, name) VALUES

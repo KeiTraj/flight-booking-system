@@ -35,6 +35,187 @@ const reportsPool = new Pool({
   connectionTimeoutMillis: 10000,
 });
 
+const refreshAnalytics = async () => {
+  try {
+    await reportsPool.query('SELECT refresh_all_analytics()');
+  } catch (err) {
+    console.error('Error refreshing analytics:', err);
+    throw err;
+  }
+};
+
+const parseDelay = (value, fallback) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+};
+
+const refreshDelayMs = parseDelay(process.env.ANALYTICS_REFRESH_DELAY_MS, 2000);
+const replicationLagTargetMs = parseDelay(process.env.ANALYTICS_REPLICATION_LAG_TARGET_MS, 1500);
+const replicationMaxWaitMs = parseDelay(process.env.ANALYTICS_REPLICATION_MAX_WAIT_MS, 60000);
+const replicationPollIntervalMs = Math.max(
+  50,
+  parseDelay(process.env.ANALYTICS_REPLICATION_POLL_INTERVAL_MS, 250)
+);
+const subscriptionName = process.env.REPORTS_SUBSCRIPTION_NAME || 'reports_sub';
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const getReplicationLagMs = async () => {
+  try {
+    const { rows } = await reportsPool.query(
+      `
+        SELECT
+          last_msg_receipt_time,
+          latest_end_time,
+          EXTRACT(EPOCH FROM write_lag) * 1000 AS write_lag_ms,
+          EXTRACT(EPOCH FROM flush_lag) * 1000 AS flush_lag_ms,
+          EXTRACT(EPOCH FROM apply_lag) * 1000 AS apply_lag_ms
+        FROM pg_catalog.pg_stat_subscription
+        WHERE subname = $1
+      `,
+      [subscriptionName]
+    );
+
+    if (!rows.length) {
+      return null;
+    }
+
+    const {
+      last_msg_receipt_time: receiptTime,
+      latest_end_time: applyTime,
+      write_lag_ms: writeLagMs,
+      flush_lag_ms: flushLagMs,
+      apply_lag_ms: applyLagMs,
+    } = rows[0];
+
+    const intervalLags = [writeLagMs, flushLagMs, applyLagMs]
+      .map((lag) => {
+        const parsed = Number(lag);
+        return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+      })
+      .filter((lag) => lag !== null);
+
+    if (intervalLags.length) {
+      return Math.max(...intervalLags);
+    }
+
+    const now = Date.now();
+    const parseTimestamp = (value) => {
+      if (!value) {
+        return null;
+      }
+
+      const timestamp = new Date(value).getTime();
+      return Number.isFinite(timestamp) ? timestamp : null;
+    };
+
+    const timestamps = [receiptTime, applyTime].map(parseTimestamp).filter((timestamp) => timestamp !== null);
+
+    if (!timestamps.length) {
+      return 0;
+    }
+
+    return Math.max(...timestamps.map((timestamp) => Math.max(0, now - timestamp)));
+  } catch (err) {
+    console.error('Failed to inspect replication status:', err);
+    return 0;
+  }
+};
+
+const waitForReplicationCatchUp = async () => {
+  if (replicationMaxWaitMs === 0) {
+    return 'skipped';
+  }
+
+  const start = Date.now();
+  let hasLoggedDelay = false;
+  let sawLagSample = false;
+
+  while (Date.now() - start < replicationMaxWaitMs) {
+    const lagMs = await getReplicationLagMs();
+
+    if (lagMs !== null) {
+      sawLagSample = true;
+
+      if (lagMs <= replicationLagTargetMs) {
+        if (hasLoggedDelay) {
+          console.info('Replication caught up; refreshing analytics.');
+        }
+        return 'caught-up';
+      }
+
+      if (!hasLoggedDelay) {
+        console.info(
+          `Waiting for replication to catch up (current lag ≈ ${Math.round(lagMs)} ms)`
+        );
+        hasLoggedDelay = true;
+      }
+    } else if (!hasLoggedDelay) {
+      console.info('Waiting for replication statistics to become available...');
+      hasLoggedDelay = true;
+    }
+
+    await sleep(replicationPollIntervalMs);
+  }
+
+  console.warn(
+    `Timed out after ${replicationMaxWaitMs} ms while waiting for replication to catch up; proceeding with refresh`
+  );
+  return sawLagSample ? 'timed-out' : 'no-stats';
+};
+
+let refreshTimer = null;
+let refreshPending = false;
+let refreshInFlight = false;
+let refreshRequestedWhileRunning = false;
+
+const runScheduledRefresh = async () => {
+  refreshTimer = null;
+
+  if (!refreshPending) {
+    return;
+  }
+
+  refreshPending = false;
+  refreshInFlight = true;
+  let shouldRetry = false;
+
+  try {
+    const replicationStatus = await waitForReplicationCatchUp();
+    await refreshAnalytics();
+    if (replicationStatus === 'timed-out' || replicationStatus === 'no-stats') {
+      shouldRetry = true;
+    }
+  } catch (err) {
+    console.error('Scheduled analytics refresh failed:', err);
+  } finally {
+    refreshInFlight = false;
+
+    const pendingWhileRunning = refreshRequestedWhileRunning;
+    refreshRequestedWhileRunning = false;
+
+    if (pendingWhileRunning || shouldRetry) {
+      scheduleAnalyticsRefresh();
+    }
+  }
+};
+
+const scheduleAnalyticsRefresh = () => {
+  if (refreshInFlight) {
+    refreshRequestedWhileRunning = true;
+    return;
+  }
+
+  refreshPending = true;
+
+  if (refreshTimer) {
+    clearTimeout(refreshTimer);
+  }
+
+  refreshTimer = setTimeout(runScheduledRefresh, refreshDelayMs);
+};
+
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
@@ -137,9 +318,11 @@ app.post('/api/bookings', async (req, res) => {
       await client.query(`
         UPDATE bookings SET status = 'confirmed' WHERE booking_id = $1
       `, [bookingId]);
-      
+
       await client.query('COMMIT');
       
+      scheduleAnalyticsRefresh();
+
       res.json({
         success: true,
         bookingId,
@@ -213,6 +396,8 @@ app.post('/api/bookings/:bookingId/cancel', async (req, res) => {
     
     await client.query('COMMIT');
     
+    scheduleAnalyticsRefresh();
+
     res.json({ success: true, message: 'Booking cancelled successfully' });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -314,7 +499,8 @@ app.get('/api/analytics/realtime-bookings', async (req, res) => {
 // Refresh reports (manual trigger)
 app.post('/api/reports/refresh', async (req, res) => {
   try {
-    await reportsPool.query('SELECT scheduled_refresh()');
+    await waitForReplicationCatchUp();
+    await refreshAnalytics();
     res.json({ success: true, message: 'Reports refreshed successfully' });
   } catch (err) {
     console.error('Report refresh error:', err);

@@ -421,19 +421,19 @@
                 
                 <div class="chart-container">
                     <h3>📊 Daily Revenue Report</h3>
-                    <button onclick="loadDailyRevenue()" style="float: right;">Refresh</button>
+                    <button onclick="handleDashboardRefresh(this)" style="float: right;">Refresh</button>
                     <div id="daily-revenue-table"></div>
                 </div>
                 
                 <div class="chart-container">
                     <h3>✈️ Flight Occupancy Report</h3>
-                    <button onclick="loadFlightOccupancy()" style="float: right;">Refresh</button>
+                    <button onclick="handleDashboardRefresh(this)" style="float: right;">Refresh</button>
                     <div id="flight-occupancy-table"></div>
                 </div>
                 
                 <div class="chart-container">
                     <h3>🗺️ Route Performance Report</h3>
-                    <button onclick="loadRoutePerformance()" style="float: right;">Refresh</button>
+                    <button onclick="handleDashboardRefresh(this)" style="float: right;">Refresh</button>
                     <div id="route-performance-table"></div>
                 </div>
             </div>
@@ -661,6 +661,7 @@
                     showAlert(`Booking confirmed! Reference: ${result.bookingReference}`, 'success');
                     closeModal();
                     searchFlights();
+                    await refreshReports({ silent: true });
                 } else {
                     showAlert(result.error || 'Booking failed', 'error');
                 }
@@ -830,14 +831,35 @@
             }
         }
         
-        async function refreshReports() {
+        async function handleDashboardRefresh(button) {
+            const originalText = button?.textContent || 'Refresh';
+            if (button) {
+                button.disabled = true;
+                button.textContent = 'Refreshing...';
+            }
+            try {
+                await refreshReports();
+            } finally {
+                if (button) {
+                    button.disabled = false;
+                    button.textContent = originalText;
+                }
+            }
+        }
+        
+        async function refreshReports(options = {}) {
+            const { silent = false } = options;
             try {
                 const response = await fetch('/api/reports/refresh', { method: 'POST' });
                 const result = await response.json();
-                showAlert('Reports refreshed successfully', 'success');
-                loadAllReports();
+                if (!silent) {
+                    showAlert('Reports refreshed successfully', 'success');
+                }
+                await loadAllReports();
             } catch (err) {
-                showAlert('Failed to refresh reports', 'error');
+                if (!silent) {
+                    showAlert('Failed to refresh reports', 'error');
+                }
             }
         }
         

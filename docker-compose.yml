@@ -115,6 +115,11 @@ services:
       REPORTS_DB_NAME: flightdb
       REPORTS_DB_USER: postgres
       REPORTS_DB_PASSWORD: postgres
+      ANALYTICS_REFRESH_DELAY_MS: 500
+      ANALYTICS_REPLICATION_LAG_TARGET_MS: 1500
+      ANALYTICS_REPLICATION_MAX_WAIT_MS: 60000
+      ANALYTICS_REPLICATION_POLL_INTERVAL_MS: 250
+      REPORTS_SUBSCRIPTION_NAME: reports_sub
       NODE_ENV: production
     depends_on:
       primary-db:
