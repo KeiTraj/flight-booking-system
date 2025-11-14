@@ -18,7 +18,7 @@ services:
     command: >
       bash -c "
       chown -R postgres:postgres /var/lib/postgresql/wal_archive;
-      exec gosu postgres postgres -c config_file=/etc/postgresql/postgresql.conf
+      exec /usr/local/bin/docker-entrypoint.sh postgres -c config_file=/etc/postgresql/postgresql.conf
       "
     networks:
       - flight-network

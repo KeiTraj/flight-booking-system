@@ -3,7 +3,7 @@
 ## 1. Start everything
 ```bash
 docker compose down -v
-docker compose up -d --build
+docker compose up -d 
 docker compose ps
 ```
 Wait until `primary-db`, `reports-db`, `hot-backup`, `wal-archiver`, and `flight-app` are all `Up`. 
