@@ -129,9 +129,8 @@ Follow these steps to demonstrate the hot standby and failover drill:
    ```bash
    docker compose exec hot-backup \
      psql -U postgres -d flightdb \
-     -c "INSERT INTO flights(flight_number, airline, origin, destination, departure_time, arrival_time, base_fare) VALUES('HB-TEST', 'HB', 'AAA', 'BBB', NOW(), NOW() + interval '1 hour', 100);"
+     -c "INSERT INTO flights(airline_id, flight_number, aircraft_id, origin, destination, departure_time, arrival_time, base_price) VALUES((SELECT airline_id FROM airlines WHERE code = 'AA' LIMIT 1), 'HB-TEST', (SELECT aircraft_id FROM aircraft WHERE registration = 'N12345' LIMIT 1), 'AAA', 'BBB', NOW(), NOW() + interval '1 hour', 100);"
    ```
    You should see `cannot execute INSERT in a read-only transaction`. Valid read-only queries (e.g., `SELECT count(*) FROM bookings;`) should still succeed.
-
 
 
